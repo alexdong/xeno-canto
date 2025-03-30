@@ -53,6 +53,19 @@ def upload_to_s3(
         raise
 
 
+def check_s3_file_exists(
+    s3_client: Any,
+    bucket: str,
+    s3_key: str,
+) -> bool:
+    """Checks if a file exists in S3."""
+    try:
+        s3_client.head_object(Bucket=bucket, Key=s3_key)
+        return True
+    except Exception:
+        return False
+
+
 def download_and_upload_recording(
     recording: Dict[str, Any],
     s3_client: Any,
@@ -65,78 +78,86 @@ def download_and_upload_recording(
     assert recording_id, "Recording data must contain an 'id'."
     # Use tqdm.write for logging to avoid messing up the progress bar
     log_func = pbar.write if pbar else print
-    # log_func(f"[INFO] Processing recording ID: {recording_id}") # Maybe too verbose with pbar
 
-    # 1. Prepare and Upload JSON metadata
+    # 1. Prepare JSON metadata path
     json_s3_key = f"{prefix}{recording_id}.json"
-    json_data = json.dumps(recording, indent=4).encode("utf-8")
-    # Suppress print messages during upload when using progress bar
-    upload_to_s3(s3_client, bucket, json_s3_key, json_data, "application/json", quiet=bool(pbar))
-
-    # 2. Download Audio File
+    
+    # 2. Prepare Audio File path
     file_url_relative: str | None = recording.get("file")
     original_filename: str | None = recording.get("file-name")
 
     if not file_url_relative or not original_filename:
         return
 
-    # Handle protocol-relative URL (starts with //)
-    if file_url_relative.startswith("//"):
-        file_url = f"https:{file_url_relative}"
-    else:
-        file_url = file_url_relative
-        if not file_url.startswith("http"):
-             log_func(f"[WARNING] Unexpected file URL format for {recording_id}: {file_url}. Prepending https:")
-             if not file_url.startswith('/'):
-                 file_url = '/' + file_url
-             file_url = f"https://xeno-canto.org{file_url}"
-
-    # log_func(f"[INFO] Downloading audio for {recording_id} from {file_url}") # Too verbose
-    try:
-        time.sleep(REQUEST_DELAY_SECONDS) # Delay *before* download request
-        response = requests.get(file_url, stream=True, timeout=60)
-        response.raise_for_status()
-        # log_func(f"[DEBUG] Download response status: {response.status_code}") # Too verbose
-
-    except requests.exceptions.RequestException as e:
-        log_func(f"[ERROR] Failed to download audio for {recording_id}: {e}")
-        raise
-
-    # 3. Prepare and Upload Audio File
+    # Prepare audio S3 key
     audio_s3_key = f"{prefix}{original_filename}"
     if not prefix.endswith('/') and prefix: # Ensure slash if prefix exists
         audio_s3_key = f"{prefix}/{original_filename}"
     elif not prefix: # Handle empty prefix
          audio_s3_key = original_filename
+    
+    # Check if both files already exist in S3
+    json_exists = check_s3_file_exists(s3_client, bucket, json_s3_key)
+    audio_exists = check_s3_file_exists(s3_client, bucket, audio_s3_key)
+    
+    if json_exists and audio_exists:
+        log_func(f"[INFO] Skipping {recording_id} - already exists in S3")
+        if pbar:
+            pbar.update(1)
+        return
 
+    # Upload JSON metadata if it doesn't exist
+    if not json_exists:
+        json_data = json.dumps(recording, indent=4).encode("utf-8")
+        upload_to_s3(s3_client, bucket, json_s3_key, json_data, "application/json", quiet=bool(pbar))
 
-    # log_func(f"[INFO] Uploading audio for {recording_id} to s3://{bucket}/{audio_s3_key}...") # Too verbose
-    try:
-        content_type = response.headers.get('Content-Type', 'application/octet-stream')
-        s3_client.upload_fileobj(
-            response.raw,
-            bucket,
-            audio_s3_key,
-            ExtraArgs={'ContentType': content_type}
-        )
-        # log_func(f"[SUCCESS] Successfully uploaded audio for {recording_id}...") # Too verbose
-    except (NoCredentialsError, PartialCredentialsError) as e:
-        log_func(f"[ERROR] S3 credentials not found or incomplete during audio upload for {recording_id}: {e}")
-        raise
-    except Exception as e:
-        log_func(f"[ERROR] Failed to upload audio for {recording_id} to S3: {e}")
-        raise
-    finally:
-        response.close()
+    # Download and upload audio file if it doesn't exist
+    if not audio_exists:
+        # Handle protocol-relative URL (starts with //)
+        if file_url_relative.startswith("//"):
+            file_url = f"https:{file_url_relative}"
+        else:
+            file_url = file_url_relative
+            if not file_url.startswith("http"):
+                 log_func(f"[WARNING] Unexpected file URL format for {recording_id}: {file_url}. Prepending https:")
+                 if not file_url.startswith('/'):
+                     file_url = '/' + file_url
+                 file_url = f"https://xeno-canto.org{file_url}"
 
-    # 4. Update Progress Bar (after successful completion of both uploads for this recording)
+        try:
+            time.sleep(REQUEST_DELAY_SECONDS) # Delay *before* download request
+            response = requests.get(file_url, stream=True, timeout=60)
+            response.raise_for_status()
+
+        except requests.exceptions.RequestException as e:
+            log_func(f"[ERROR] Failed to download audio for {recording_id}: {e}")
+            raise
+
+        try:
+            content_type = response.headers.get('Content-Type', 'application/octet-stream')
+            s3_client.upload_fileobj(
+                response.raw,
+                bucket,
+                audio_s3_key,
+                ExtraArgs={'ContentType': content_type}
+            )
+        except (NoCredentialsError, PartialCredentialsError) as e:
+            log_func(f"[ERROR] S3 credentials not found or incomplete during audio upload for {recording_id}: {e}")
+            raise
+        except Exception as e:
+            log_func(f"[ERROR] Failed to upload audio for {recording_id} to S3: {e}")
+            raise
+        finally:
+            response.close()
+
+    # Update Progress Bar (after successful completion of both uploads for this recording)
     if pbar:
         pbar.update(1)
 
 
-def fetch_and_process_pages(query: str, s3_client: Any, bucket: str, prefix: str) -> None:
+def fetch_and_process_pages(query: str, s3_client: Any, bucket: str, prefix: str, start_page: int = 1) -> None:
     """Fetches all pages for a query and processes each recording, showing progress."""
-    current_page: int = 1
+    current_page: int = start_page
     total_pages: int = 1 # Assume 1 initially
     num_recordings_total_str: str = "0"
     processed_recordings_count: int = 0
@@ -145,10 +166,49 @@ def fetch_and_process_pages(query: str, s3_client: Any, bucket: str, prefix: str
     print(f"[INFO] Fetching initial metadata to determine total recordings...")
 
     try:
+        # First, get the total number of pages and recordings
+        api_url = f"{API_ENDPOINT}?query={query}&page=1"
+        try:
+            response = requests.get(api_url, timeout=30)
+            response.raise_for_status()
+            data: Dict[str, Any] = response.json()
+            
+            total_pages = int(data.get("numPages", 1))
+            num_recordings_total_str = data.get("numRecordings", "0")
+            num_recordings_total = int(num_recordings_total_str)
+            
+            print(f"[INFO] Query found {num_recordings_total_str} recordings across {total_pages} pages.")
+            
+            if num_recordings_total == 0:
+                print("[INFO] No recordings found for the query. Exiting.")
+                return
+                
+            # Calculate how many recordings we're skipping
+            if start_page > 1:
+                recordings_per_page = len(data.get("recordings", []))
+                skipped_recordings = (start_page - 1) * recordings_per_page
+                print(f"[INFO] Starting from page {start_page}, skipping approximately {skipped_recordings} recordings.")
+                # Adjust total for progress bar
+                num_recordings_total = max(0, num_recordings_total - skipped_recordings)
+            
+            # Initialize the progress bar here
+            recording_pbar = tqdm(
+                total=num_recordings_total,
+                desc="Processing Recordings",
+                unit="file",
+                ncols=100
+            )
+            
+        except requests.exceptions.RequestException as e:
+            print(f"[ERROR] Failed to fetch API data for initial page: {e}")
+            raise
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Failed to decode JSON response for initial page: {e}")
+            raise
+
+        # Now process from the requested start page
         while current_page <= total_pages:
             api_url = f"{API_ENDPOINT}?query={query}&page={current_page}"
-            # Don't show page fetching in pbar, use print
-            # Use tqdm.write if pbar exists, else print
             log_func = recording_pbar.write if recording_pbar else print
             log_func(f"[INFO] Fetching page {current_page} / {total_pages}...")
 
@@ -171,27 +231,7 @@ def fetch_and_process_pages(query: str, s3_client: Any, bucket: str, prefix: str
                 log_func(f"[ERROR] API returned error: {error_info.get('code')} - {error_info.get('message')}")
                 raise ValueError(f"API Error: {error_info.get('code')} - {error_info.get('message')}")
 
-            if current_page == 1:
-                total_pages = int(data.get("numPages", 1))
-                num_recordings_total_str = data.get("numRecordings", "0")
-                num_recordings_total = int(num_recordings_total_str)
-                print(f"[INFO] Query found {num_recordings_total_str} recordings across {total_pages} pages.")
-
-                if num_recordings_total == 0:
-                    print("[INFO] No recordings found for the query. Exiting.")
-                    return
-
-                # Initialize the progress bar here, now that we know the total
-                recording_pbar = tqdm(
-                    total=num_recordings_total,
-                    desc="Processing Recordings",
-                    unit="file",
-                    ncols=100 # Adjust width if needed
-                )
-
             recordings: List[Dict[str, Any]] = data.get("recordings", [])
-            # Don't print count per page when using pbar
-            # log_func(f"[INFO] Processing {len(recordings)} recordings from page {current_page}.")
 
             for recording in recordings:
                 # Pass the progress bar instance to the download function
@@ -233,6 +273,12 @@ def main() -> None:
         default=S3_PREFIX,
         help=f"The S3 prefix (folder path) within the bucket (default: {S3_PREFIX})",
     )
+    parser.add_argument(
+        "--start-page",
+        type=int,
+        default=1,
+        help="Page number to start from (default: 1)",
+    )
     args = parser.parse_args()
 
     s3_prefix = args.prefix
@@ -245,6 +291,7 @@ def main() -> None:
     print(f"🔍 Query: {args.query}")
     print(f"☁️  Target S3 Bucket: {args.bucket}")
     print(f"📁 Target S3 Prefix: {s3_prefix}")
+    print(f"📄 Starting from page: {args.start_page}")
     print(f"⏱️  API Delay: {REQUEST_DELAY_SECONDS} seconds between requests")
 
     try:
@@ -259,7 +306,7 @@ def main() -> None:
         print(f"[FATAL] Could not initialize S3 client: {e}")
         raise
 
-    fetch_and_process_pages(args.query, s3_client, args.bucket, s3_prefix)
+    fetch_and_process_pages(args.query, s3_client, args.bucket, s3_prefix, args.start_page)
 
     print("✅ Download and upload process finished!")
 
