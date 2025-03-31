@@ -274,6 +274,7 @@ def main() -> None:
         help=f"The S3 prefix (folder path) within the bucket (default: {S3_PREFIX})",
     )
     parser.add_argument(
+        "-p",
         "--start-page",
         type=int,
         default=1,
